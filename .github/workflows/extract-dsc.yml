@@ -73,12 +73,7 @@ jobs:
           mkdir -p upload
           cp extract.json upload/ 2>/dev/null || true
           cp extract.err upload/ 2>/dev/null || true
-          find ./out -type f -exec sh -c '
-            for f; do
-              sz=$(stat -f%z "$f" 2>/dev/null || echo 0)
-              if [ "$sz" -lt 100000000 ]; then cp "$f" upload/ 2>/dev/null || true; fi
-            done
-          ' sh {} +
+          ( cd ./out && find . -type f -size -100M -print0 | tar --null -T - -czf "$RUNNER_TEMP/upload/small-files.tar.gz" )
           echo "=== upload dir ==="; ls -la upload/ | head -20
           du -sh upload
 
@@ -100,11 +95,9 @@ jobs:
         run: |
           cd "$RUNNER_TEMP"
           mkdir -p parts
-          i=0
           find ./out -type f -size +100M | while read -r f; do
-            i=$((i+1))
             echo "splitting $f"
-            split -b 900m "$f" "parts/part_${i}_" 2>/dev/null || true
+            split -b 900m "$f" "parts/$(basename "$f")." 2>/dev/null || true
           done
           ls -la parts/ | head -20
           du -sh parts
