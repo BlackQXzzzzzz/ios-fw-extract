@@ -1,0 +1,118 @@
+name: extract-dsc
+
+on:
+  workflow_dispatch:
+    inputs:
+      ota_url:
+        description: 'OTA URL'
+        required: true
+        default: 'https://updates.cdn-apple.com/2025FallFCS/mobileassets/082-75475/8B9D9F04-0315-486B-B6D7-74CBDE6B69F7/com_apple_MobileAsset_SoftwareUpdate/d3096ea61ca4ede122ea1319fc34fa4578fbfee23ce0434be8b23e815f96453a.aea'
+      aea_key:
+        description: 'AEA decryption key (base64)'
+        required: true
+        default: 'G4nXofLNVZ2UcF3Iz6yS6JVi0Hr6yfisNC0QfYD+dHY='
+      arch:
+        description: 'dyld arch'
+        required: true
+        default: 'arm64e'
+
+jobs:
+  extract:
+    runs-on: macos-15
+    timeout-minutes: 120
+    steps:
+      - name: Environment info
+        run: |
+          echo "=== CPU ==="; sysctl -n hw.ncpu
+          echo "=== RAM ==="; sysctl -n hw.memsize | awk '{print $1/1024/1024/1024 " GB"}'
+          echo "=== Disk ==="; df -h /
+          echo "=== macOS ==="; sw_vers
+          echo "=== Work dir ==="; echo "$RUNNER_TEMP"; df -h "$RUNNER_TEMP"
+
+      - name: Install ipsw
+        run: |
+          brew install blacktop/tap/ipsw
+          ipsw version
+
+      - name: Download OTA
+        run: |
+          cd "$RUNNER_TEMP"
+          echo "Starting download..."
+          curl -L --retry 5 --retry-delay 10 --connect-timeout 30 -C - \
+            -o ota.aea "${{ inputs.ota_url }}"
+          ls -la ota.aea
+          echo "=== Disk after download ==="; df -h /
+
+      - name: Verify AEA header
+        run: |
+          cd "$RUNNER_TEMP"
+          xxd -l 64 ota.aea
+
+      - name: Extract dyld_shared_cache
+        run: |
+          cd "$RUNNER_TEMP"
+          mkdir -p out
+          echo "=== Disk before extract ==="; df -h /
+          set +e
+          ipsw ota extract ota.aea --dyld --dyld-arch "${{ inputs.arch }}" \
+            --confirm --key-val "${{ inputs.aea_key }}" \
+            --output ./out --json > extract.json 2> extract.err
+          RC=$?
+          echo "RC=$RC"
+          echo "=== stderr tail ==="; tail -30 extract.err
+          echo "=== json head ==="; head -c 2000 extract.json
+          echo
+          echo "=== Disk after extract ==="; df -h /
+          echo "=== out ==="; find ./out -type f | head -30
+          du -sh ./out 2>/dev/null
+          exit 0
+
+      - name: Collect results
+        run: |
+          cd "$RUNNER_TEMP"
+          mkdir -p upload
+          cp extract.json upload/ 2>/dev/null || true
+          cp extract.err upload/ 2>/dev/null || true
+          find ./out -type f -exec sh -c '
+            for f; do
+              sz=$(stat -f%z "$f" 2>/dev/null || echo 0)
+              if [ "$sz" -lt 100000000 ]; then cp "$f" upload/ 2>/dev/null || true; fi
+            done
+          ' sh {} +
+          echo "=== upload dir ==="; ls -la upload/ | head -20
+          du -sh upload
+
+      - name: Delete OTA to free space
+        run: |
+          cd "$RUNNER_TEMP"
+          rm -f ota.aea
+          echo "=== Disk after cleanup ==="; df -h /
+
+      - name: Upload small artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsc-result-json
+          path: ${{ runner.temp }}/upload/
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Split and upload dsc
+        run: |
+          cd "$RUNNER_TEMP"
+          mkdir -p parts
+          i=0
+          find ./out -type f -size +100M | while read -r f; do
+            i=$((i+1))
+            echo "splitting $f"
+            split -b 900m "$f" "parts/part_${i}_" 2>/dev/null || true
+          done
+          ls -la parts/ | head -20
+          du -sh parts
+
+      - name: Upload dsc parts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsc-parts
+          path: ${{ runner.temp }}/parts/
+          retention-days: 7
+          if-no-files-found: warn
