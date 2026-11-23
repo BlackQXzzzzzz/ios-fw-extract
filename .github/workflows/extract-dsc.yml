@@ -15,6 +15,10 @@ on:
         description: 'dyld arch'
         required: true
         default: 'arm64e'
+      tag:
+        description: 'Caller correlation tag (echoed to logs and ft_tag.txt)'
+        required: false
+        default: ''
 
 jobs:
   extract:
@@ -28,18 +32,60 @@ jobs:
           echo "=== Disk ==="; df -h /
           echo "=== macOS ==="; sw_vers
           echo "=== Work dir ==="; echo "$RUNNER_TEMP"; df -h "$RUNNER_TEMP"
+          echo "FT_TAG=${{ inputs.tag }}"
 
       - name: Install ipsw
         run: |
-          brew install blacktop/tap/ipsw
-          ipsw version
+          for i in 1 2 3 4; do
+            if brew install blacktop/tap/ipsw; then
+              ipsw version
+              exit 0
+            fi
+            echo "brew install attempt $i failed; retrying after 15s"
+            sleep 15
+          done
+          echo "brew install failed after 4 attempts"
+          exit 1
 
-      - name: Download OTA
+      - name: Download OTA (parallel ranged)
         run: |
           cd "$RUNNER_TEMP"
-          echo "Starting download..."
-          curl -L --retry 5 --retry-delay 10 --connect-timeout 30 -C - \
-            -o ota.aea "${{ inputs.ota_url }}"
+          URL="${{ inputs.ota_url }}"
+          echo "Starting download: $URL"
+          SIZE=$(curl -sIL --retry 5 --retry-delay 5 --connect-timeout 30 "$URL" | grep -i '^content-length' | tail -1 | tr -d '\r' | awk '{print $2}')
+          echo "content-length=$SIZE"
+          N=8
+          ok=1
+          if [ -n "$SIZE" ] && [ "$SIZE" -gt 200000000 ]; then
+            CHUNK=$(( (SIZE + N - 1) / N ))
+            for i in $(seq 0 $((N-1))); do
+              S=$(( i * CHUNK )); E=$(( S + CHUNK - 1 )); [ "$E" -ge "$SIZE" ] && E=$(( SIZE - 1 ))
+              curl -sfL --retry 5 --retry-delay 10 --connect-timeout 30 -r "$S-$E" -o "part_$i" "$URL" &
+            done
+            wait
+            # verify + repair pass
+            for i in $(seq 0 $((N-1))); do
+              S=$(( i * CHUNK )); E=$(( S + CHUNK - 1 )); [ "$E" -ge "$SIZE" ] && E=$(( SIZE - 1 ))
+              EXP=$(( E - S + 1 ))
+              ACT=$(stat -f%z "part_$i" 2>/dev/null || echo 0)
+              if [ "$ACT" != "$EXP" ]; then
+                echo "repair part_$i ($ACT != $EXP)"
+                curl -sfL --retry 5 --retry-delay 10 --connect-timeout 30 -r "$S-$E" -o "part_$i" "$URL"
+                ACT=$(stat -f%z "part_$i" 2>/dev/null || echo 0)
+                [ "$ACT" = "$EXP" ] || { echo "part_$i unrecoverable"; ok=0; }
+              fi
+            done
+            if [ "$ok" = "1" ]; then
+              cat part_* > ota.aea
+              rm -f part_*
+              ACT=$(stat -f%z ota.aea)
+              echo "assembled size=$ACT expected=$SIZE"
+              [ "$ACT" = "$SIZE" ] && exit 0
+            fi
+            echo "parallel path failed — clean single-stream fallback"
+            rm -f part_* ota.aea
+          fi
+          curl -L --retry 5 --retry-delay 10 --connect-timeout 30 -C - -o ota.aea "$URL"
           ls -la ota.aea
           echo "=== Disk after download ==="; df -h /
 
@@ -73,6 +119,7 @@ jobs:
           mkdir -p upload
           cp extract.json upload/ 2>/dev/null || true
           cp extract.err upload/ 2>/dev/null || true
+          printf '%s' "${{ inputs.tag }}" > upload/ft_tag.txt
           ( cd ./out && find . -type f -size -100M -print0 | tar --null -T - -czf "$RUNNER_TEMP/upload/small-files.tar.gz" )
           echo "=== upload dir ==="; ls -la upload/ | head -20
           du -sh upload
