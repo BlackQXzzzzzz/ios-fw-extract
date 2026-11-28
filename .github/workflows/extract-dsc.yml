@@ -19,6 +19,10 @@ on:
         description: 'Caller correlation tag (echoed to logs and ft_tag.txt)'
         required: false
         default: ''
+      ota_form:
+        description: 'OTA payload form: aea (keyed personalized, default) or zip (old-generation patches/*.zip)'
+        required: false
+        default: 'aea'
 
 jobs:
   extract:
@@ -51,6 +55,9 @@ jobs:
         run: |
           cd "$RUNNER_TEMP"
           URL="${{ inputs.ota_url }}"
+          EXT="aea"
+          if [ "${{ inputs.ota_form }}" = "zip" ]; then EXT="zip"; fi
+          echo "OTA_FORM=${{ inputs.ota_form }} EXT=$EXT"
           echo "Starting download: $URL"
           SIZE=$(curl -sIL --retry 5 --retry-delay 5 --connect-timeout 30 "$URL" | grep -i '^content-length' | tail -1 | tr -d '\r' | awk '{print $2}')
           echo "content-length=$SIZE"
@@ -76,25 +83,42 @@ jobs:
               fi
             done
             if [ "$ok" = "1" ]; then
-              cat part_* > ota.aea
+              cat part_* > ota.$EXT
               rm -f part_*
-              ACT=$(stat -f%z ota.aea)
+              ACT=$(stat -f%z ota.$EXT)
               echo "assembled size=$ACT expected=$SIZE"
               [ "$ACT" = "$SIZE" ] && exit 0
             fi
             echo "parallel path failed — clean single-stream fallback"
-            rm -f part_* ota.aea
+            rm -f part_* ota.aea ota.zip
           fi
-          curl -L --retry 5 --retry-delay 10 --connect-timeout 30 -C - -o ota.aea "$URL"
-          ls -la ota.aea
+          curl -L --retry 5 --retry-delay 10 --connect-timeout 30 -C - -o ota.$EXT "$URL"
+          ls -la ota.$EXT
           echo "=== Disk after download ==="; df -h /
 
       - name: Verify AEA header
+        if: inputs.ota_form != 'zip'
         run: |
           cd "$RUNNER_TEMP"
           xxd -l 64 ota.aea
+      - name: Verify zip payload and enumerate members
+        if: inputs.ota_form == 'zip'
+        run: |
+          cd "$RUNNER_TEMP"
+          echo "=== zip magic (expect PK) ==="
+          xxd -l 16 ota.zip
+          M=$(xxd -p -l 2 ota.zip)
+          [ "$M" = "504b" ] && echo "ZIP_MAGIC_OK" || { echo "ZIP_MAGIC_UNEXPECTED=$M"; exit 1; }
+          echo "=== zip inventory (head 80) ==="
+          unzip -l ota.zip | head -80
+          echo "=== cryptex/system/dmg members ==="
+          unzip -l ota.zip | grep -i 'cryptex\|system\|\.dmg' | head -40 || echo "no cryptex/system/dmg named members"
+          echo "=== all members count ==="
+          unzip -l ota.zip | tail -1
+
 
       - name: Extract dyld_shared_cache
+        if: inputs.ota_form != 'zip'
         run: |
           cd "$RUNNER_TEMP"
           mkdir -p out
@@ -113,6 +137,56 @@ jobs:
           du -sh ./out 2>/dev/null
           exit 0
 
+      - name: Extract dyld_shared_cache (zip form probe)
+        if: inputs.ota_form == 'zip'
+        run: |
+          cd "$RUNNER_TEMP"
+          mkdir -p out
+          echo "=== Disk before zip extract ==="; df -h /
+          echo "=== trial A: ipsw ota extract direct on zip (no key) ==="
+          set +e
+          ipsw ota extract ota.zip --dyld --dyld-arch "${{ inputs.arch }}" --confirm --output ./out --json > extract.json 2> extract.err
+          RC_A=$?
+          echo "RC_A=$RC_A"
+          echo "--- stderr tail A ---"; tail -30 extract.err
+          echo "--- json head A ---"; head -c 2000 extract.json; echo
+          if [ "$RC_A" != "0" ] || [ -z "$(find ./out -type f | head -1)" ]; then
+            echo "=== trial B: unzip + cryptex member chain ==="
+            mkdir -p unz
+            unzip -q ota.zip -d unz
+            echo "--- unz dirs (maxdepth 4) ---"; find unz -maxdepth 4 -type d | head -40
+            echo "--- big file candidates ---"
+            find unz -type f -size +50M | head -20
+            echo "--- candidate magic bytes (16B each, top 5) ---"
+            for f in $(find unz -type f -size +50M | head -5); do
+              echo "--- $f ($(stat -f%z "$f") bytes)"; xxd -l 16 "$f"
+            done
+            CRYPT=$(find unz -type f -iname '*cryptex*system*' | head -1)
+            [ -z "$CRYPT" ] && CRYPT=$(find unz -type f -name '*.dmg' -size +100M | head -1)
+            echo "CRYPT=$CRYPT"
+            if [ -n "$CRYPT" ]; then
+              echo "--- payload metadata plist (if any) ---"
+              find unz -name 'metadata*' -o -name '*.plist' | head -10
+              for p in $(find unz -name 'metadata*' | head -2); do
+                echo "--- $p head ---"; head -c 1500 "$p"; echo
+                plutil -p "$p" 2>/dev/null | grep -iA2 'base\|cryptex' | head -40 || true
+              done
+              echo "--- ipsw ota patch rsr --cryptex trial ---"
+              ipsw ota patch rsr --cryptex "$CRYPT" --output ./out --json > extract.json 2> extract.err
+              RC_B=$?
+              echo "RC_B=$RC_B"
+              tail -30 extract.err
+              head -c 2000 extract.json; echo
+            else
+              echo "NO cryptex/system dmg candidate found in zip"
+              echo "ZIP_FORM_PROBE:no_cryptex_candidate"
+            fi
+          fi
+          echo "=== out tree ==="; find ./out -type f | head -30
+          du -sh ./out 2>/dev/null
+          echo "=== Disk after zip extract ==="; df -h /
+          exit 0
+
       - name: Collect results
         run: |
           cd "$RUNNER_TEMP"
@@ -127,7 +201,8 @@ jobs:
       - name: Delete OTA to free space
         run: |
           cd "$RUNNER_TEMP"
-          rm -f ota.aea
+          rm -f ota.aea ota.zip
+          rm -rf unz
           echo "=== Disk after cleanup ==="; df -h /
 
       - name: Upload small artifacts
